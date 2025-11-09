@@ -126,6 +126,7 @@ __global__ void ldmatrix(half *A, half *B, uint64_t *latency) {
     A_s[i + tidx] = A[i + tidx];
   }
   __syncthreads();
+  asm volatile("" ::: "memory"); // compiler barrier
   uint64_t start = clock64();
   // assume non-negative tidx
   int lane8 = tidx & 7;
@@ -141,6 +142,7 @@ __global__ void ldmatrix(half *A, half *B, uint64_t *latency) {
       "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
       : "=r"(A_frag[0]), "=r"(A_frag[1]), "=r"(A_frag[2]), "=r"(A_frag[3])
       : "r"(A_addr));
+  asm volatile("" ::: "memory"); // compiler barrier
   uint64_t stop = clock64();
   latency[tidx] = stop - start;
   *((uint32_t *)(&B[tidx * 8])) = A_frag[0];
@@ -156,6 +158,7 @@ __global__ void load(half *A, half *B, uint64_t *latency) {
     A_s[i + tidx] = A[i + tidx];
   }
   __syncthreads();
+  asm volatile("" ::: "memory"); // compiler barrier
   uint64_t start = clock64();
   uint32_t A_frag[4];
   int q = tidx >> 2;
@@ -165,6 +168,7 @@ __global__ void load(half *A, half *B, uint64_t *latency) {
   A_frag[1] = *(uint32_t *)(&A_s[base + 8]);
   A_frag[2] = *(uint32_t *)(&A_s[base + 16 * 8]);
   A_frag[3] = *(uint32_t *)(&A_s[base + 16 * 8 + 8]);
+  asm volatile("" ::: "memory"); // compiler barrier
   uint64_t stop = clock64();
   latency[tidx] = stop - start;
   *((uint32_t *)(&B[tidx * 8])) = A_frag[0];
