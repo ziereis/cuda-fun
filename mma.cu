@@ -120,30 +120,34 @@ __global__ void mma(half *A, half *B, half *C) {
   *((uint32_t *)(&C[8 * (8 + row_id) + col_id * 2])) = C_frag[1];
 }
 
-template <int M, int N>
-__device__ void _mma_smem_smem_smem(half *A, half *B, half *C, int K) {
+template <int M, int N, int K, int NUM_THREADS>
+__device__ void _mma_sync_smem_smem_smem(half *__restrict A, half *__restrict B,
+                                         half *__restrict C) {
   const int tidx = threadIdx.x;
+  const int widx = threadIdx.x / WARP_SIZE;
+  constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
   constexpr int mma_m = 16;
   constexpr int mma_n = 8;
   constexpr int mma_k = 16;
 #pragma unroll
   for (int m = 0; m < M; m += mma_m) {
 #pragma unroll
-    for (int n = 0; n < N; n += mma_n) {
+    for (int n = 0; n < N; n += mma_n * NUM_WARPS) {
       // mma_n / 2 because we are allocating 32 bit registers
       uint32_t C_tile[mma_m * (mma_n / 2)] = {0};
       for (int k = 0; k < K; k += mma_k) {
-        half *A_row = &A[K + ((tidx % 8) * K + (tidx / 16) * K * 8 +
-                              ((tidx / 8) % 2) * 8)];
+        half *A_row = &A[(K + (tidx % 8) * K + (tidx / 16) * K * 8 +
+                          ((tidx / 8) % 2) * 8)];
         uint32_t A_addr = __cvta_generic_to_shared(A_row);
         uint32_t A_frag[4];
-        asm volatile(
-            "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-            : "=r"(A_frag[0]), "=r"(A_frag[1]), "=r"(A_frag[2]), "=r"(A_frag[3])
-            : "r"(A_addr));
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, "
+                     "%3}, [%4];\n"
+                     : "=r"(A_frag[0]), "=r"(A_frag[1]), "=r"(A_frag[2]),
+                       "=r"(A_frag[3])
+                     : "r"(A_addr));
 
-        printf("tidx%d loads B at %d\n", tidx, tidx * 8);
-        half *B_row = &B[K + (tidx * K)];
+        // printf("tidx%d loads B at %d\n", tidx, tidx * 8);
+        half *B_row = &B[(K + tidx) * N + mma_n * widx];
         uint32_t B_addr = __cvta_generic_to_shared(B_row);
         uint32_t B_frag[2];
         asm volatile(
@@ -169,47 +173,88 @@ __device__ void _mma_smem_smem_smem(half *A, half *B, half *C, int K) {
         int row_id = tidx / 4;
         int col_id = tidx % 4;
         // printf("tidx%d writes to %d\n", tidx, row_id * 8 + col_id * 2);
-        // printf("tidx%d writes to %d\n", tidx, 8 * (8 + row_id) + col_id * 2);
+        // printf("tidx%d writes to %d\n", tidx, 8 * (8 + row_id) + col_id *
+        // 2);
         C_tile[(row_id * 8 + col_id * 2)] += C_frag[0];
         C_tile[8 * (8 + row_id) + col_id * 2] = C_frag[1];
-      }
-      for (int mm = 0; mm < mma_m; mm++) {
-        for (int nn = 0; nn < mma_n / 2; nn++) {
-          ((uint32_t *)C)[(m + mm) * M + n + nn] = C_tile[mm * mma_m + n];
+        for (int mm = 0; mm < mma_m; mm++) {
+          for (int nn = 0; nn < mma_n / 2; nn++) {
+            ((uint32_t *)C)[(m + mm) * M + n + nn] = C_tile[mm * mma_m + n];
+          }
         }
       }
     }
   }
 }
 
-template <int TILE_M, int TILE_N, int TILE_K>
+template <int M, int N, int K, int NUM_THREADS>
+__device__ void _mma_smem_smem_smem(half *__restrict A, half *__restrict B,
+                                    half *__restrict C) {
+  const int tidx = threadIdx.x % WARP_SIZE;
+  const int widx = threadIdx.x / WARP_SIZE;
+  constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
+#pragma unroll
+  for (int m = 0; m < M; m += NUM_WARPS) {
+#pragma unroll
+    for (int n = 0; n < N; n += WARP_SIZE) {
+      half C_tile[NUM_WARPS * WARP_SIZE] = {0.0};
+      for (int k = 0; k < K; k++) {
+        C_tile[widx * WARP_SIZE + tidx] +=
+            A[(m + widx) * K + k] * B[k * N + n + tidx];
+      }
+      C[(m + widx) * N + n + tidx] = C_tile[widx * WARP_SIZE + tidx];
+    }
+  }
+}
+
+template <int TILE_M, int TILE_N, int TILE_K, int NUM_THREADS>
 __global__ void matmul(half *A, half *B, half *C, int M, int N, int K) {
   const int tidx = threadIdx.x % WARP_SIZE;
-  const int warp_idx = threadIdx.x / WARP_SIZE;
-  __shared__ half A_s[TILE_M * TILE_K];
-  __shared__ half B_s[TILE_N * TILE_K];
-  __shared__ half C_s[TILE_M * TILE_N];
-  for (int m = 0; m < TILE_M; m++) {
-    for (int k = 0; k < TILE_K; k += WARP_SIZE) {
-      A_s[m * TILE_K + k + tidx] =
-          A[(blockIdx.x + m) * K + blockIdx.y + k + tidx];
+  const int widx = threadIdx.x / WARP_SIZE;
+  constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
+  __shared__ __align__(16) half A_s[TILE_M * TILE_K];
+  __shared__ __align__(16) half B_s[TILE_K * TILE_N];
+  __shared__ __align__(16) half C_s[TILE_M * TILE_N];
+
+  const int m = blockIdx.x;
+  const int n = blockIdx.y;
+  for (int mm = 0; mm < TILE_M; mm += NUM_WARPS) {
+    for (int nn = 0; nn < TILE_N; nn += WARP_SIZE) {
+      C_s[(mm + widx) * TILE_N + nn + tidx] = 0.0;
     }
   }
-  for (int k = 0; k < TILE_K; k++) {
-    for (int n = 0; n < TILE_N; n += WARP_SIZE) {
-      B_s[k * TILE_N + n + tidx] =
-          B[(blockIdx.x + k) * N + blockIdx.y + n + tidx];
-    }
-  }
+
   __syncthreads();
+
   for (int k = 0; k < TILE_K; k += TILE_K) {
-    _mma_smem_smem_smem<TILE_M, TILE_N>(half * A, half * B, half * C, int K)
+    for (int mm = 0; mm < TILE_M; mm += NUM_WARPS) {
+      for (int kk = 0; kk < TILE_K; kk += WARP_SIZE) {
+        A_s[(mm + widx) * TILE_K + kk + tidx] =
+            A[(m + mm + widx) * K + k + kk + tidx];
+      }
+    }
+    for (int kk = 0; kk < TILE_K; kk += NUM_WARPS) {
+      for (int nn = 0; nn < TILE_N; nn += WARP_SIZE) {
+        B_s[(kk + widx) * TILE_N + nn + tidx] =
+            B[(k + kk + widx) * N + n + nn + tidx];
+      }
+    }
+
+    __syncthreads();
+
+    _mma_smem_smem_smem<TILE_M, TILE_N, TILE_K, NUM_THREADS>(A_s, B_s, C_s);
+  }
+  for (int mm = 0; mm < TILE_M; mm += NUM_WARPS) {
+    for (int nn = 0; nn < TILE_N; nn += WARP_SIZE) {
+      C[(m + mm + widx) * N + n + nn + tidx] =
+          C_s[(mm + widx) * TILE_N + nn + tidx];
+    }
   }
 }
 
 int main() {
   // Simple test: Identity matrix * ones vector
-  const int M = 16, K = 16, N = 8;
+  const int M = 16, K = 32, N = 64;
 
   half *h_A = new half[M * K];
   half *h_B = new half[K * N];
@@ -217,7 +262,7 @@ int main() {
 
   for (int i = 0; i < M; ++i) {
     for (int j = 0; j < K; ++j) {
-      float v = (i == j) ? float(i + 1) : 0.0f;
+      float v = (i == j) ? 1.0 : 0.0f;
       h_A[i * K + j] = __float2half(v);
     }
   }
@@ -243,14 +288,13 @@ int main() {
   cudaMemcpy(d_B, h_B, K * N * sizeof(half), cudaMemcpyHostToDevice);
   cudaMemcpy(d_C, h_C, M * N * sizeof(half), cudaMemcpyHostToDevice);
 
-  // Launch kernel with 1 warp (32 threads)
-  mma<<<1, 32>>>(d_A, d_B, d_C);
+  matmul<16, 64, 32, 128><<<1, 128>>>(d_A, d_B, d_C, M, N, K);
 
   // Copy result back
   cudaMemcpy(h_C, d_C, M * N * sizeof(half), cudaMemcpyDeviceToHost);
 
   // Print result (should be all 1s since I * ones = ones)
-  printf("Result C (16x8):\n");
+  printf("Result C (%dx%d):\n", M, N);
   for (int i = 0; i < M; i++) {
     for (int j = 0; j < N; j++) {
       printf("%.1f ", __half2float(h_C[i * N + j]));
