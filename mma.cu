@@ -2,8 +2,10 @@
 #include <cstdint>
 #include <cuda.h>
 #include <cuda_fp16.h>
+#include <random>
 #include <stdio.h>
 #include <sys/types.h>
+
 
 #define WARP_SIZE 32
 
@@ -237,7 +239,7 @@ __global__ void matmul(half *A, half *B, half *C, int M, int N, int K) {
 
     __syncthreads();
 
-    _mma_sync_smem_smem_smem<TILE_M, TILE_N, TILE_K, NUM_THREADS>(A_s, B_s,
+    _mma_smem_smem_smem<TILE_M, TILE_N, TILE_K, NUM_THREADS>(A_s, B_s,
                                                                   C_s);
     __syncthreads();
   }
@@ -249,12 +251,122 @@ __global__ void matmul(half *A, half *B, half *C, int M, int N, int K) {
   }
 }
 
+template <int TILE_M, int TILE_N, int TILE_K, int NUM_THREADS>
+void cuda_matmul(half *A, half *B, half *C, int M, int N, int K) {
+  dim3 grid_dim(M / TILE_M, N / TILE_N);
+  dim3 block_dim(NUM_THREADS);
+
+  matmul<TILE_M, TILE_N, TILE_K, NUM_THREADS><<<grid_dim, block_dim>>>(A, B, C, M, N, K);
+  cudaDeviceSynchronize();
+}
+
+void ref_matmul(half* A,half* B, half* C, int M, int N, int K) {
+  for (int m = 0; m < M; ++m) {
+    for (int n = 0; n < N; ++n) {
+      half c_val = __float2half(0.0f);
+      for (int k = 0; k < K; ++k) {
+        c_val = __hadd(c_val, __hmul(A[m * K + k], B[k * N + n]));
+      }
+      C[m * N + n] = c_val;
+    }
+  }
+}
+
+
+void print_matrix(half *mat, int rows, int cols) {
+  for (int i = 0; i < rows; ++i) {
+    for (int j = 0; j < cols; ++j) {
+      printf("%.2f ", __half2float(mat[i * cols + j]));
+    }
+    printf("\n");
+  }
+}
+
+void check_results(half *h_C_ref, half *h_C_gpu, int M, int N, float epsilon = 1e-2) {
+  bool ok = true;
+  for (int i = 0; i < M * N; ++i) {
+    float ref_val = __half2float(h_C_ref[i]);
+    float gpu_val = __half2float(h_C_gpu[i]);
+    if (fabs(ref_val - gpu_val) > epsilon) {
+      ok = false;
+      printf("Error at index %d: ref=%.4f, gpu=%.4f\n", i, ref_val, gpu_val);
+      break;
+    }
+  }
+  if (ok) {
+    printf("Results match!\n");
+  } else {
+    printf("Results mismatch.\n");
+    printf("Reference:");
+    print_matrix(h_C_ref, M, N);
+    printf("GPU result:\n");
+    print_matrix(h_C_gpu, M, N);
+  }
+}
+
+
+template<int TILE_M, int TILE_N, int TILE_K, int NUM_THREADS>
+void validate_matmul(int M, int N, int K) {
+  // randomly generate A, B and K matrices on host
+  half *h_A_rand = new half[M * K];
+  half *h_B_rand = new half[K * N];
+  half *h_C_ref = new half[M * N];
+  half *h_C_gpu = new half[M * N];
+  std::random_device rd;
+  std::mt19937 gen(rd());
+  std::uniform_real_distribution<> distrib(0.0, 1.0);
+
+  for (int i = 0; i < M * K; ++i) {
+    h_A_rand[i] = __float2half(distrib(gen));
+  }
+  for (int i = 0; i < K * N; ++i) {
+    h_B_rand[i] = __float2half(distrib(gen));
+  }
+  for (int i = 0; i < M * N; ++i) {
+    h_C_ref[i] = __float2half(0.0f);
+    h_C_gpu[i] = __float2half(0.0f);
+  }
+
+  // Calculate reference result on CPU
+  ref_matmul(h_A_rand, h_B_rand, h_C_ref, M, N, K);
+
+  // Allocate device memory and copy data
+  half *d_A, *d_B, *d_C;
+  cudaMalloc(&d_A, M * K * sizeof(half));
+  cudaMalloc(&d_B, K * N * sizeof(half));
+  cudaMalloc(&d_C, M * N * sizeof(half));
+
+  cudaMemcpy(d_A, h_A_rand, M * K * sizeof(half), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_B, h_B_rand, K * N * sizeof(half), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_C, h_C_gpu, M * N * sizeof(half), cudaMemcpyHostToDevice); // Initialize d_C with zeros
+
+  // Execute kernel
+  cuda_matmul<TILE_M, TILE_N, TILE_K, NUM_THREADS>(d_A, d_B, d_C, M, N, K);
+
+  // Copy result back to host
+  cudaMemcpy(h_C_gpu, d_C, M * N * sizeof(half), cudaMemcpyDeviceToHost);
+
+  // Check results
+  check_results(h_C_ref, h_C_gpu, M, N);
+
+  // Cleanup
+  delete[] h_A_rand;
+  delete[] h_B_rand;
+  delete[] h_C_ref;
+  delete[] h_C_gpu;
+  cudaFree(d_A);
+  cudaFree(d_B);
+  cudaFree(d_C);
+
+}
+
 int main() {
   // Simple test: Identity matrix * ones vector
   const int M = 32, K = 64, N = 64;
   constexpr int TILE_M = 16, TILE_K = 32, TILE_N = 32;
-
   constexpr int num_threads = 128;
+  validate_matmul<TILE_M, TILE_N, TILE_K, num_threads>(M, N, K);
+
 
   half *h_A = new half[M * K];
   half *h_B = new half[K * N];
