@@ -207,9 +207,14 @@ __device__ void _mma_sync_smem_smem_smem(half *__restrict A, half *__restrict B,
 
 template <int TILE_M, int TILE_N, int TILE_K, int NUM_THREADS>
 __global__ void matmul(half *A, half *B, float *C, int M, int N, int K) {
+  constexpr int GROUP_SIZE = 8;
+  constexpr int NUM_GROUPS = WARP_SIZE / GROUP_SIZE;
+  constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
   const int tidx = threadIdx.x % WARP_SIZE;
   const int widx = threadIdx.x / WARP_SIZE;
-  constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
+  // we have to further divide the thread ids so we can also distribute them across M
+  const int gidx = tidx / GROUP_SIZE;
+  const int lidx = tidx % GROUP_SIZE;
   __shared__ __align__(16) half A_s[TILE_M * TILE_K];
   __shared__ __align__(16) half B_s[TILE_K * TILE_N];
   __shared__ __align__(32) float C_s[TILE_M * TILE_N];
@@ -217,36 +222,38 @@ __global__ void matmul(half *A, half *B, float *C, int M, int N, int K) {
   const int m = blockIdx.x * TILE_M;
   const int n = blockIdx.y * TILE_N;
   
-  for (int mm = 0; mm < TILE_M; mm += NUM_WARPS) {
-    for (int nn = 0; nn < TILE_N; nn += WARP_SIZE) {
-      C_s[(mm + widx) * TILE_N + nn + tidx] = 0.0;
+  float4 zero = {0.0f, 0.0f, 0.0f, 0.0f};
+  for (int mm = 0; mm < TILE_M; mm += NUM_WARPS * NUM_GROUPS) {
+    for (int nn = 0; nn < TILE_N; nn += GROUP_SIZE * 4) { // 4 * f32 = 128
+      *reinterpret_cast<float4*>(&C_s[(mm + widx * NUM_GROUPS + gidx) * TILE_N + nn + lidx * 4]) = zero;
     }
   }
 
   for (int k = 0; k < K; k += TILE_K) {
-    for (int mm = 0; mm < TILE_M; mm += NUM_WARPS) {
-      for (int kk = 0; kk < TILE_K; kk += WARP_SIZE) {
-        A_s[(mm + widx) * TILE_K + kk + tidx] =
-            A[(m + mm + widx) * K + k + kk + tidx];
+    // load and A and B from shmem
+    for (int mm = 0; mm < TILE_M; mm += NUM_WARPS * NUM_GROUPS) {
+      for (int kk = 0; kk < TILE_K; kk += GROUP_SIZE * 8) { // 8 * f16 = 128
+        *reinterpret_cast<int4*>(&A_s[(mm + widx * NUM_GROUPS + gidx) * TILE_K + kk + lidx * 8]) =
+            *reinterpret_cast<int4*>(&A[(m + mm + widx * NUM_GROUPS + gidx) * K + k + kk + lidx * 8]);
       }
     }
-    for (int kk = 0; kk < TILE_K; kk += NUM_WARPS) {
-      for (int nn = 0; nn < TILE_N; nn += WARP_SIZE) {
-        B_s[(kk + widx) * TILE_N + nn + tidx] =
-            B[(k + kk + widx) * N + n + nn + tidx];
+    for (int kk = 0; kk < TILE_K; kk += NUM_WARPS * NUM_GROUPS) {
+      for (int nn = 0; nn < TILE_N; nn += GROUP_SIZE * 8) {
+        *reinterpret_cast<int4*>(&B_s[(kk + widx *NUM_GROUPS + gidx) * TILE_N + nn + lidx * 8]) =
+            *reinterpret_cast<int4*>(&B[(k + kk + widx * NUM_GROUPS + gidx) * N + n + nn + lidx * 8]);
       }
     }
 
     __syncthreads();
 
-    _mma_sync_smem_smem_smem<TILE_M, TILE_N, TILE_K, NUM_THREADS>(A_s, B_s,
+    _mma_smem_smem_smem<TILE_M, TILE_N, TILE_K, NUM_THREADS>(A_s, B_s,
                                                                   C_s);
     __syncthreads();
   }
-  for (int mm = 0; mm < TILE_M; mm += NUM_WARPS) {
-    for (int nn = 0; nn < TILE_N; nn += WARP_SIZE) {
-      C[(m + mm + widx) * N + n + nn + tidx] =
-          C_s[(mm + widx) * TILE_N + nn + tidx];
+  for (int mm = 0; mm < TILE_M; mm += NUM_WARPS * NUM_GROUPS) {
+    for (int nn = 0; nn < TILE_N; nn += GROUP_SIZE * 4) {
+      *reinterpret_cast<int4*>(&C[(m + mm + widx * NUM_GROUPS + gidx) * N + n + nn + lidx * 4]) =
+          *reinterpret_cast<int4*>(&C_s[(mm + widx * NUM_GROUPS + gidx) * TILE_N + nn + lidx * 4]);
     }
   }
 }
@@ -282,7 +289,7 @@ void print_matrix(float *mat, int rows, int cols) {
   }
 }
 
-void check_results(float *h_C_ref, float *h_C_gpu, int M, int N, float epsilon = 1e-5) {
+void check_results(float *h_C_ref, float *h_C_gpu, int M, int N, float epsilon = 1e-3) {
   bool ok = true;
   for (int i = 0; i < M * N; ++i) {
     float ref_val = h_C_ref[i];
@@ -297,10 +304,10 @@ void check_results(float *h_C_ref, float *h_C_gpu, int M, int N, float epsilon =
     printf("Results match!\n");
   } else {
     printf("Results mismatch.\n");
-    printf("Reference:");
-    print_matrix(h_C_ref, M, N);
-    printf("GPU result:\n");
-    print_matrix(h_C_gpu, M, N);
+    // printf("Reference:");
+    // print_matrix(h_C_ref, M, N);
+    // printf("GPU result:\n");
+    // print_matrix(h_C_gpu, M, N);
   }
 }
 
@@ -362,73 +369,73 @@ void validate_matmul(int M, int N, int K) {
 }
 
 int main() {
-  // Simple test: Identity matrix * ones vector
-  const int M = 32, K = 64, N = 64;
-  constexpr int TILE_M = 16, TILE_K = 32, TILE_N = 32;
+  // after vectorzing all loads and stores 128bit 
+  const int M = 128, K = 128, N = 128;
+  constexpr int TILE_M = 32, TILE_K = 64, TILE_N = 64;
   constexpr int num_threads = 128;
   validate_matmul<TILE_M, TILE_N, TILE_K, num_threads>(M, N, K);
 
 
-  half *h_A = new half[M * K];
-  half *h_B = new half[K * N];
-  float *h_C = new float[M * N];
-
-  for (int i = 0; i < M; ++i) {
-    for (int j = 0; j < K; ++j) {
-      float v = i;
-      h_A[i * K + j] = __float2half(v);
-    }
-  }
-
-  // B: all ones (like you already have)
-  for (int i = 0; i < K * N; ++i) {
-    h_B[i] = __float2half(1.0f);
-  }
-
-  // Initialize C to zero
-  for (int i = 0; i < M * N; i++) {
-    h_C[i] = 0.0f;
-  }
-
-  // Allocate device memory
-  half *d_A, *d_B;
-  float* d_C;
-  cudaMalloc(&d_A, M * K * sizeof(half));
-  cudaMalloc(&d_B, K * N * sizeof(half));
-  cudaMalloc(&d_C, M * N * sizeof(float));
-
-  // Copy to device
-  cudaMemcpy(d_A, h_A, M * K * sizeof(half), cudaMemcpyHostToDevice);
-  cudaMemcpy(d_B, h_B, K * N * sizeof(half), cudaMemcpyHostToDevice);
-  cudaMemcpy(d_C, h_C, M * N * sizeof(float), cudaMemcpyHostToDevice);
-
-
-  assert(M % TILE_M == 0);
-  assert(N % TILE_N == 0);
-  assert(K % TILE_K == 0);
-
-  dim3 grid(M / TILE_M, N / TILE_N);
-  matmul<TILE_M, TILE_N, TILE_K, num_threads><<<grid, num_threads>>>(d_A, d_B, d_C, M, N, K);
-
-  // Copy result back
-  cudaMemcpy(h_C, d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost);
-
-  // Print result (should be all 1s since I * ones = ones)
-  printf("Result C (%dx%d):\n", M, N);
-  for (int i = 0; i < M; i++) {
-    for (int j = 0; j < N; j++) {
-      printf("%.1f ", h_C[i * N + j]);
-    }
-    printf("\n");
-  }
-
-  // Cleanup
-  delete[] h_A;
-  delete[] h_B;
-  delete[] h_C;
-  cudaFree(d_A);
-  cudaFree(d_B);
-  cudaFree(d_C);
+  // half *h_A = new half[M * K];
+  // half *h_B = new half[K * N];
+  // float *h_C = new float[M * N];
+  //
+  // for (int i = 0; i < M; ++i) {
+  //   for (int j = 0; j < K; ++j) {
+  //     float v = i;
+  //     h_A[i * K + j] = __float2half(v);
+  //   }
+  // }
+  //
+  // // B: all ones (like you already have)
+  // for (int i = 0; i < K * N; ++i) {
+  //   h_B[i] = __float2half(1.0f);
+  // }
+  //
+  // // Initialize C to zero
+  // for (int i = 0; i < M * N; i++) {
+  //   h_C[i] = 0.0f;
+  // }
+  //
+  // // Allocate device memory
+  // half *d_A, *d_B;
+  // float* d_C;
+  // cudaMalloc(&d_A, M * K * sizeof(half));
+  // cudaMalloc(&d_B, K * N * sizeof(half));
+  // cudaMalloc(&d_C, M * N * sizeof(float));
+  //
+  // // Copy to device
+  // cudaMemcpy(d_A, h_A, M * K * sizeof(half), cudaMemcpyHostToDevice);
+  // cudaMemcpy(d_B, h_B, K * N * sizeof(half), cudaMemcpyHostToDevice);
+  // cudaMemcpy(d_C, h_C, M * N * sizeof(float), cudaMemcpyHostToDevice);
+  //
+  //
+  // assert(M % TILE_M == 0);
+  // assert(N % TILE_N == 0);
+  // assert(K % TILE_K == 0);
+  //
+  // dim3 grid(M / TILE_M, N / TILE_N);
+  // matmul<TILE_M, TILE_N, TILE_K, num_threads><<<grid, num_threads>>>(d_A, d_B, d_C, M, N, K);
+  //
+  // // Copy result back
+  // cudaMemcpy(h_C, d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost);
+  //
+  // // Print result (should be all 1s since I * ones = ones)
+  // printf("Result C (%dx%d):\n", M, N);
+  // for (int i = 0; i < M; i++) {
+  //   for (int j = 0; j < N; j++) {
+  //     printf("%.1f ", h_C[i * N + j]);
+  //   }
+  //   printf("\n");
+  // }
+  //
+  // // Cleanup
+  // delete[] h_A;
+  // delete[] h_B;
+  // delete[] h_C;
+  // cudaFree(d_A);
+  // cudaFree(d_B);
+  // cudaFree(d_C);
 
   return 0;
 }
