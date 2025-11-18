@@ -5,7 +5,7 @@
 #include <random>
 #include <stdio.h>
 #include <sys/types.h>
-
+#include <cublas_v2.h>
 
 #define WARP_SIZE 32
 
@@ -159,8 +159,8 @@ __device__ void _mma_sync_smem_smem_smem(half *__restrict A, half *__restrict B,
       uint32_t C_frag[4] = {0};
       for (int k = 0; k < K; k += mma_k) {
         
-        int a0 = m * K + k;
-        int idx_A = a0 + (tidx % 8) * K + (tidx / 16) * K * 8 +
+        int a0 = m * (K + 8) + k;
+        int idx_A = a0 + (tidx % 8) * (K + 8) + (tidx / 16) * (K+8) * 8 +
                     ((tidx / 8) % 2) * 8;
         // printf("tidx%d widx%d loads A at %d\n", tidx, widx, idx_A);
         half *A_row = &A[idx_A];
@@ -172,9 +172,33 @@ __device__ void _mma_sync_smem_smem_smem(half *__restrict A, half *__restrict B,
                        "=r"(A_frag[3])
                      : "r"(A_addr));
 
-        // printf("tidx%d widx%d loads B at %d\n", tidx, widx,
-        // (k + tidx) * N + mma_n * widx);
-        half *B_row = &B[(k + (tidx % 16)) * N + n + mma_n * widx];
+        // each thread in a warp loads 4 consecutive bytes (8 f16 elements)
+        // starting at indices 
+        // N is always some multiple of 32
+        // we can calculate the bank of an address like this:
+        // bank = (address / 4) % 32
+        // assume N -> 64 f16s -> 128 bytes
+        // 0 * N: bank = (0 / 4) % 32 -> 0
+        // 1 * N: bank = (128 / 4) % 32 -> 0
+        // 2 * N: bank = (256 / 4) % 32 -> 0
+        // ..
+        // 15 * N: bank = (1920 / 4) % 32 -> 0
+        // here all 16 threads would try to access the same memory bank and we get bank conflicts
+        // now if we were to pad N by 2 elements (or 4 bytes)
+        // assume N -> 66 f16s -> 132 bytes
+        // 0 * N: bank = (0 / 4) % 32 -> 0
+        // 1 * N: bank = (132 / 4) % 32 -> 1
+        // 2 * N: bank = (264 / 4) % 32 -> 2
+        // ..
+        // 15 * N: bank = (1980 / 4) % 32 -> 15
+        // now if we were to pad N by 8 elements (or 16 bytes)
+        // assume N -> 74 f16s -> 144 bytes
+        // 0 * N: bank = (0 / 4) % 32 -> 0
+        // 1 * N: bank = (144 / 4) % 32 -> 4
+        // 2 * N: bank = (264 / 4) % 32 -> 2
+        // ..
+        // 15 * N: bank = (1980 / 4) % 32 -> 15
+        half *B_row = &B[(k + (tidx % 16)) * (N + 8) + n + mma_n * widx];
         uint32_t B_addr = __cvta_generic_to_shared(B_row);
         uint32_t B_frag[2];
         asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 "
@@ -192,12 +216,12 @@ __device__ void _mma_sync_smem_smem_smem(half *__restrict A, half *__restrict B,
       }
       int row_id = tidx / 4;
       int col_id = tidx % 4;
-      int c0 = m * N + n + widx * mma_n;
-      int idx = c0 + row_id * N + col_id * 2;
+      int c0 = m * (N+4) + n + widx * mma_n;
+      int idx = c0 + row_id * (N+4) + col_id * 2;
       float* C_fragf32 = reinterpret_cast<float*>(C_frag);
       C[idx] += C_fragf32[0];
       C[idx+1] += C_fragf32[1];
-      idx = c0 + (8 + row_id) * N + col_id * 2; 
+      idx = c0 + (8 + row_id) * (N+4) + col_id * 2; 
       C[idx] += C_fragf32[2];
       C[idx+1] += C_fragf32[3];
     }
@@ -215,9 +239,9 @@ __global__ void matmul(half *A, half *B, float *C, int M, int N, int K) {
   // we have to further divide the thread ids so we can also distribute them across M
   const int gidx = tidx / GROUP_SIZE;
   const int lidx = tidx % GROUP_SIZE;
-  __shared__ __align__(16) half A_s[TILE_M * TILE_K];
-  __shared__ __align__(16) half B_s[TILE_K * TILE_N];
-  __shared__ __align__(32) float C_s[TILE_M * TILE_N];
+  __shared__ __align__(16) half A_s[TILE_M * (TILE_K + 8)];
+  __shared__ __align__(16) half B_s[TILE_K * (TILE_N + 8)];
+  __shared__ __align__(16) float C_s[TILE_M * (TILE_N + 4)];
 
   const int m = blockIdx.x * TILE_M;
   const int n = blockIdx.y * TILE_N;
@@ -225,35 +249,51 @@ __global__ void matmul(half *A, half *B, float *C, int M, int N, int K) {
   float4 zero = {0.0f, 0.0f, 0.0f, 0.0f};
   for (int mm = 0; mm < TILE_M; mm += NUM_WARPS * NUM_GROUPS) {
     for (int nn = 0; nn < TILE_N; nn += GROUP_SIZE * 4) { // 4 * f32 = 128
-      *reinterpret_cast<float4*>(&C_s[(mm + widx * NUM_GROUPS + gidx) * TILE_N + nn + lidx * 4]) = zero;
+      *reinterpret_cast<float4*>(&C_s[(mm + widx * NUM_GROUPS + gidx) * (TILE_N + 4) + nn + lidx * 4]) = zero;
     }
   }
 
   for (int k = 0; k < K; k += TILE_K) {
     // load and A and B from shmem
+    // determination of bank conflicts is made per memory transaction
+    // a single memory transaction is 128 bytes
+    // groups of 8 threads load 128 consecutive bytes  
+    // which banks do threads access?
+    // t0 -> b0-b03
+    // t1 -> b4-b07
+    // t2 -> b8-b11
+    // t3 -> b12-b15
+    // t4 -> b16-b19
+    // t5 -> b20-b23
+    // t6 -> b24-b27
+    // t7 -> b28-b31
+    // t8 -> b0-b03
+    // t8 is in a new memory transaction so there are no bank conflicts
     for (int mm = 0; mm < TILE_M; mm += NUM_WARPS * NUM_GROUPS) {
       for (int kk = 0; kk < TILE_K; kk += GROUP_SIZE * 8) { // 8 * f16 = 128
-        *reinterpret_cast<int4*>(&A_s[(mm + widx * NUM_GROUPS + gidx) * TILE_K + kk + lidx * 8]) =
+        *reinterpret_cast<int4*>(&A_s[(mm + widx * NUM_GROUPS + gidx) * (TILE_K + 8) + kk + lidx * 8]) =
             *reinterpret_cast<int4*>(&A[(m + mm + widx * NUM_GROUPS + gidx) * K + k + kk + lidx * 8]);
       }
     }
+    // same applies here
     for (int kk = 0; kk < TILE_K; kk += NUM_WARPS * NUM_GROUPS) {
       for (int nn = 0; nn < TILE_N; nn += GROUP_SIZE * 8) {
-        *reinterpret_cast<int4*>(&B_s[(kk + widx *NUM_GROUPS + gidx) * TILE_N + nn + lidx * 8]) =
+        *reinterpret_cast<int4*>(&B_s[(kk + widx *NUM_GROUPS + gidx) * (TILE_N + 8) + nn + lidx * 8]) =
             *reinterpret_cast<int4*>(&B[(k + kk + widx * NUM_GROUPS + gidx) * N + n + nn + lidx * 8]);
       }
     }
 
     __syncthreads();
 
-    _mma_smem_smem_smem<TILE_M, TILE_N, TILE_K, NUM_THREADS>(A_s, B_s,
+    _mma_sync_smem_smem_smem<TILE_M, TILE_N, TILE_K, NUM_THREADS>(A_s, B_s,
                                                                   C_s);
     __syncthreads();
   }
+  // and here
   for (int mm = 0; mm < TILE_M; mm += NUM_WARPS * NUM_GROUPS) {
     for (int nn = 0; nn < TILE_N; nn += GROUP_SIZE * 4) {
       *reinterpret_cast<int4*>(&C[(m + mm + widx * NUM_GROUPS + gidx) * N + n + nn + lidx * 4]) =
-          *reinterpret_cast<int4*>(&C_s[(mm + widx * NUM_GROUPS + gidx) * TILE_N + nn + lidx * 4]);
+          *reinterpret_cast<int4*>(&C_s[(mm + widx * NUM_GROUPS + gidx) * (TILE_N + 4) + nn + lidx * 4]);
     }
   }
 }
@@ -311,6 +351,122 @@ void check_results(float *h_C_ref, float *h_C_gpu, int M, int N, float epsilon =
   }
 }
 
+template<int TILE_M, int TILE_N, int TILE_K, int NUM_THREADS>
+void benchmark_matmul(int M, int N, int K, int num_iterations = 100) {
+  // Allocate and initialize host memory
+  half *h_A = new half[M * K];
+  half *h_B = new half[K * N];
+  std::random_device rd;
+  std::mt19937 gen(rd());
+  std::uniform_real_distribution<> distrib(0.0, 1.0);
+  
+  for (int i = 0; i < M * K; ++i) {
+    h_A[i] = __float2half(distrib(gen));
+  }
+  for (int i = 0; i < K * N; ++i) {
+    h_B[i] = __float2half(distrib(gen));
+  }
+
+  // Allocate device memory
+  half *d_A, *d_B;
+  float *d_C_custom, *d_C_cublas;
+  cudaMalloc(&d_A, M * K * sizeof(half));
+  cudaMalloc(&d_B, K * N * sizeof(half));
+  cudaMalloc(&d_C_custom, M * N * sizeof(float));
+  cudaMalloc(&d_C_cublas, M * N * sizeof(float));
+
+  // Copy data to device
+  cudaMemcpy(d_A, h_A, M * K * sizeof(half), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_B, h_B, K * N * sizeof(half), cudaMemcpyHostToDevice);
+
+  // Initialize cuBLAS
+  cublasHandle_t handle;
+  cublasCreate(&handle);
+  cublasSetMathMode(handle, CUBLAS_TENSOR_OP_MATH);
+
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
+
+  // Warmup runs
+  for (int i = 0; i < 10; ++i) {
+    cuda_matmul<TILE_M, TILE_N, TILE_K, NUM_THREADS>(d_A, d_B, d_C_custom, M, N, K);
+    cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                 N, M, K,
+                 &alpha,
+                 d_B, CUDA_R_16F, N,
+                 d_A, CUDA_R_16F, K,
+                 &beta,
+                 d_C_cublas, CUDA_R_32F, N,
+                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+  }
+  cudaDeviceSynchronize();
+
+  // Benchmark custom kernel
+  cudaEvent_t start, stop;
+  cudaEventCreate(&start);
+  cudaEventCreate(&stop);
+
+  cudaEventRecord(start);
+  for (int i = 0; i < num_iterations; ++i) {
+    cuda_matmul<TILE_M, TILE_N, TILE_K, NUM_THREADS>(d_A, d_B, d_C_custom, M, N, K);
+  }
+  cudaEventRecord(stop);
+  cudaEventSynchronize(stop);
+
+  float custom_time_ms;
+  cudaEventElapsedTime(&custom_time_ms, start, stop);
+  float custom_time_avg = custom_time_ms / num_iterations;
+
+  // Benchmark cuBLAS
+  cudaEventRecord(start);
+  for (int i = 0; i < num_iterations; ++i) {
+    cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                 N, M, K,
+                 &alpha,
+                 d_B, CUDA_R_16F, N,
+                 d_A, CUDA_R_16F, K,
+                 &beta,
+                 d_C_cublas, CUDA_R_32F, N,
+                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+  }
+  cudaEventRecord(stop);
+  cudaEventSynchronize(stop);
+
+  float cublas_time_ms;
+  cudaEventElapsedTime(&cublas_time_ms, start, stop);
+  float cublas_time_avg = cublas_time_ms / num_iterations;
+
+  // Calculate performance metrics
+  double flops = 2.0 * M * N * K;
+  double custom_tflops = (flops / (custom_time_avg / 1000.0)) / 1e12;
+  double cublas_tflops = (flops / (cublas_time_avg / 1000.0)) / 1e12;
+  double efficiency = (custom_tflops / cublas_tflops) * 100.0;
+
+  // Print results
+  printf("\n========== Benchmark Results ==========\n");
+  printf("Matrix dimensions: M=%d, N=%d, K=%d\n", M, N, K);
+  printf("Tile config: TILE_M=%d, TILE_N=%d, TILE_K=%d, NUM_THREADS=%d\n", 
+         TILE_M, TILE_N, TILE_K, NUM_THREADS);
+  printf("Iterations: %d\n\n", num_iterations);
+  printf("Custom Kernel:  %.4f ms  (%.2f TFLOPS)\n", custom_time_avg, custom_tflops);
+  printf("cuBLAS:         %.4f ms  (%.2f TFLOPS)\n", cublas_time_avg, cublas_tflops);
+  printf("Efficiency:     %.2f%%\n", efficiency);
+  printf("Speedup:        %.2fx %s\n", 
+         custom_time_avg < cublas_time_avg ? cublas_time_avg / custom_time_avg : cublas_time_avg / custom_time_avg,
+         custom_time_avg < cublas_time_avg ? "(faster)" : "(slower)");
+  printf("=======================================\n\n");
+
+  // Cleanup
+  cudaEventDestroy(start);
+  cudaEventDestroy(stop);
+  cublasDestroy(handle);
+  delete[] h_A;
+  delete[] h_B;
+  cudaFree(d_A);
+  cudaFree(d_B);
+  cudaFree(d_C_custom);
+  cudaFree(d_C_cublas);
+}
 
 template<int TILE_M, int TILE_N, int TILE_K, int NUM_THREADS>
 void validate_matmul(int M, int N, int K) {
@@ -370,10 +526,11 @@ void validate_matmul(int M, int N, int K) {
 
 int main() {
   // after vectorzing all loads and stores 128bit 
-  const int M = 128, K = 128, N = 128;
-  constexpr int TILE_M = 32, TILE_K = 64, TILE_N = 64;
+  const int M = 1024, K = 1024, N = 1024;
+  constexpr int TILE_M = 64, TILE_K = 64, TILE_N = 128;
   constexpr int num_threads = 128;
   validate_matmul<TILE_M, TILE_N, TILE_K, num_threads>(M, N, K);
+  benchmark_matmul<TILE_M,TILE_N, TILE_K, num_threads>(M, N, K);
 
 
   // half *h_A = new half[M * K];
