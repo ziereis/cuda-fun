@@ -151,9 +151,7 @@ __device__ void _mma_sync_smem_smem_smem(half *__restrict A, half *__restrict B,
   constexpr int mma_m = 16;
   constexpr int mma_n = 8;
   constexpr int mma_k = 16;
-#pragma unroll
   for (int m = 0; m < M; m += mma_m) {
-#pragma unroll
     for (int n = 0; n < N; n += mma_n * NUM_WARPS) {
       // mma_n / 2 because we are allocating 32 bit registers
       uint32_t C_frag[4] = {0};
@@ -214,6 +212,15 @@ __device__ void _mma_sync_smem_smem_smem(half *__restrict A, half *__restrict B,
                      : "r"(A_frag[0]), "r"(A_frag[2]), "r"(A_frag[1]), // permute A here it needs to b passed col major
                        "r"(A_frag[3]), "r"(B_frag[0]), "r"(B_frag[1]));
       }
+
+      // to which banks do the threads store to?
+      // every thread stores 8 bytes
+      // assuming N is 64 = 256 bytes
+      // bank = (idx / 4) % 32
+      // t0: idx = 0 * (256 + 4) + 0 * 2; banks(0,1)
+      // t0: idx = (8+0) * (256 + 4) + 0 * 2; banks(8,9)
+      // t1: idx = 0 * (256 + 4) + 1 * 2; banks(0,1)
+      // t1: idx = (8+0) * (256 + 4) + 1 * 2; banks(8,9)
       int row_id = tidx / 4;
       int col_id = tidx % 4;
       int c0 = m * (N+4) + n + widx * mma_n;
@@ -228,68 +235,94 @@ __device__ void _mma_sync_smem_smem_smem(half *__restrict A, half *__restrict B,
   }
 }
 
-
-template <int TILE_M, int TILE_N, int TILE_K, int NUM_THREADS>
+template <int TILE_M, int TILE_N, int TILE_K, int NUM_THREADS, int PIPELINE_STAGES>
 __global__ void matmul(half *A, half *B, float *C, int M, int N, int K) {
   constexpr int GROUP_SIZE = 8;
   constexpr int NUM_GROUPS = WARP_SIZE / GROUP_SIZE;
   constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
   const int tidx = threadIdx.x % WARP_SIZE;
   const int widx = threadIdx.x / WARP_SIZE;
-  // we have to further divide the thread ids so we can also distribute them across M
   const int gidx = tidx / GROUP_SIZE;
   const int lidx = tidx % GROUP_SIZE;
-  __shared__ __align__(16) half A_s[TILE_M * (TILE_K + 8)];
-  __shared__ __align__(16) half B_s[TILE_K * (TILE_N + 8)];
+  
+  // N-stage buffered shared memory
+  __shared__ __align__(16) half A_s[PIPELINE_STAGES][TILE_M * (TILE_K + 8)];
+  __shared__ __align__(16) half B_s[PIPELINE_STAGES][TILE_K * (TILE_N + 8)];
   __shared__ __align__(16) float C_s[TILE_M * (TILE_N + 4)];
-
+  
   const int m = blockIdx.x * TILE_M;
   const int n = blockIdx.y * TILE_N;
+  const int num_tiles = (K + TILE_K - 1) / TILE_K;
   
+  // Initialize C_s
   float4 zero = {0.0f, 0.0f, 0.0f, 0.0f};
   for (int mm = 0; mm < TILE_M; mm += NUM_WARPS * NUM_GROUPS) {
-    for (int nn = 0; nn < TILE_N; nn += GROUP_SIZE * 4) { // 4 * f32 = 128
+    for (int nn = 0; nn < TILE_N; nn += GROUP_SIZE * 4) {
       *reinterpret_cast<float4*>(&C_s[(mm + widx * NUM_GROUPS + gidx) * (TILE_N + 4) + nn + lidx * 4]) = zero;
     }
   }
-
-  for (int k = 0; k < K; k += TILE_K) {
-    // load and A and B from shmem
-    // determination of bank conflicts is made per memory transaction
-    // a single memory transaction is 128 bytes
-    // groups of 8 threads load 128 consecutive bytes  
-    // which banks do threads access?
-    // t0 -> b0-b03
-    // t1 -> b4-b07
-    // t2 -> b8-b11
-    // t3 -> b12-b15
-    // t4 -> b16-b19
-    // t5 -> b20-b23
-    // t6 -> b24-b27
-    // t7 -> b28-b31
-    // t8 -> b0-b03
-    // t8 is in a new memory transaction so there are no bank conflicts
+  
+  // Helper lambda for loading a tile
+  auto load_tile = [&](int tile_idx, int buffer_idx) {
+    int k = tile_idx * TILE_K;
+    if (k >= K) return;
+    
     for (int mm = 0; mm < TILE_M; mm += NUM_WARPS * NUM_GROUPS) {
-      for (int kk = 0; kk < TILE_K; kk += GROUP_SIZE * 8) { // 8 * f16 = 128
-        *reinterpret_cast<int4*>(&A_s[(mm + widx * NUM_GROUPS + gidx) * (TILE_K + 8) + kk + lidx * 8]) =
-            *reinterpret_cast<int4*>(&A[(m + mm + widx * NUM_GROUPS + gidx) * K + k + kk + lidx * 8]);
+      for (int kk = 0; kk < TILE_K; kk += GROUP_SIZE * 8) {
+        if (k + kk + lidx * 8 < K) {
+          uint32_t smem_addr = __cvta_generic_to_shared(
+              &A_s[buffer_idx][(mm + widx * NUM_GROUPS + gidx) * (TILE_K + 8) + kk + lidx * 8]);
+          const half* gmem_addr = &A[(m + mm + widx * NUM_GROUPS + gidx) * K + k + kk + lidx * 8];
+          asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(smem_addr), "l"(gmem_addr));
+        }
       }
     }
-    // same applies here
+    
     for (int kk = 0; kk < TILE_K; kk += NUM_WARPS * NUM_GROUPS) {
       for (int nn = 0; nn < TILE_N; nn += GROUP_SIZE * 8) {
-        *reinterpret_cast<int4*>(&B_s[(kk + widx *NUM_GROUPS + gidx) * (TILE_N + 8) + nn + lidx * 8]) =
-            *reinterpret_cast<int4*>(&B[(k + kk + widx * NUM_GROUPS + gidx) * N + n + nn + lidx * 8]);
+        if (k + kk + widx * NUM_GROUPS + gidx < K) {
+          uint32_t smem_addr = __cvta_generic_to_shared(
+              &B_s[buffer_idx][(kk + widx * NUM_GROUPS + gidx) * (TILE_N + 8) + nn + lidx * 8]);
+          const half* gmem_addr = &B[(k + kk + widx * NUM_GROUPS + gidx) * N + n + nn + lidx * 8];
+          asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(smem_addr), "l"(gmem_addr));
+        }
       }
     }
-
+    asm volatile("cp.async.commit_group;\n" ::);
+  };
+  
+  // Prefetch first PIPELINE_STAGES-1 tiles
+  #pragma unroll
+  for (int stage = 0; stage < PIPELINE_STAGES - 1; ++stage) {
+    load_tile(stage, stage);
+  }
+  
+  // Main loop with N-stage software pipelining
+  for (int tile_idx = 0; tile_idx < num_tiles; ++tile_idx) {
+    int read_buffer = tile_idx % PIPELINE_STAGES;
+    int write_buffer = (tile_idx + PIPELINE_STAGES - 1) % PIPELINE_STAGES;
+    
+    // Issue load for tile (tile_idx + PIPELINE_STAGES - 1)
+    if (tile_idx + PIPELINE_STAGES - 1 < num_tiles) {
+      load_tile(tile_idx + PIPELINE_STAGES - 1, write_buffer);
+    }
+    
+    // Wait until current tile is ready (keep PIPELINE_STAGES-1 groups in flight)
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(PIPELINE_STAGES - 1));
     __syncthreads();
-
-    _mma_sync_smem_smem_smem<TILE_M, TILE_N, TILE_K, NUM_THREADS>(A_s, B_s,
-                                                                  C_s);
+    
+    // Compute current tile
+    _mma_sync_smem_smem_smem<TILE_M, TILE_N, TILE_K, NUM_THREADS>(
+        A_s[read_buffer], B_s[read_buffer], C_s);
+    
     __syncthreads();
   }
-  // and here
+  
+  // Wait for all remaining async copies
+  asm volatile("cp.async.wait_group %0;\n" :: "n"(0));
+  __syncthreads();
+  
+  // Store results
   for (int mm = 0; mm < TILE_M; mm += NUM_WARPS * NUM_GROUPS) {
     for (int nn = 0; nn < TILE_N; nn += GROUP_SIZE * 4) {
       *reinterpret_cast<int4*>(&C[(m + mm + widx * NUM_GROUPS + gidx) * N + n + nn + lidx * 4]) =
@@ -303,7 +336,7 @@ void cuda_matmul(half *A, half *B, float *C, int M, int N, int K) {
   dim3 grid_dim(M / TILE_M, N / TILE_N);
   dim3 block_dim(NUM_THREADS);
 
-  matmul<TILE_M, TILE_N, TILE_K, NUM_THREADS><<<grid_dim, block_dim>>>(A, B, C, M, N, K);
+  matmul<TILE_M, TILE_N, TILE_K, NUM_THREADS, 2><<<grid_dim, block_dim>>>(A, B, C, M, N, K);
   cudaDeviceSynchronize();
 }
 
@@ -528,7 +561,7 @@ int main() {
   // after vectorzing all loads and stores 128bit 
   const int M = 1024, K = 1024, N = 1024;
   constexpr int TILE_M = 64, TILE_K = 64, TILE_N = 128;
-  constexpr int num_threads = 128;
+  constexpr int num_threads = 256;
   validate_matmul<TILE_M, TILE_N, TILE_K, num_threads>(M, N, K);
   benchmark_matmul<TILE_M,TILE_N, TILE_K, num_threads>(M, N, K);
 
