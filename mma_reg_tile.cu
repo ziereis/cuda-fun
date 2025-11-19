@@ -9,35 +9,108 @@
 
 #define WARP_SIZE 32
 
-template<int LDA, int LDB, int NUM_THREADS>
-__device__ void mma_m16n8k16(half* __restrict A_s, half* __restrict B_s, uint32_t* __restrict C_frag) {
+
+template<int M, int N, int K, int LDA, int LDB, int NUM_THREADS>
+__device__ void _mma_sync_smem_smem_reg_n_dist(half *__restrict A_s, half *__restrict  B_s,
+                                        uint32_t *__restrict C_frag){
   const int tidx = threadIdx.x % WARP_SIZE;
-  int idx_A = (tidx % 8) * LDA + (tidx / 16) * LDA * 8 +
-                    ((tidx / 8) % 2) * 8;
-  half *A_row = A_s + idx_A;
-  uint32_t A_addr = __cvta_generic_to_shared(A_row);
-  uint32_t A_frag[4];
-  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, "
-               "%3}, [%4];\n"
-               : "=r"(A_frag[0]), "=r"(A_frag[1]), "=r"(A_frag[2]),
-                 "=r"(A_frag[3])
-               : "r"(A_addr));
-  int idx_B =(tidx % 16) * LDB;
-  half *B_row = B_s + idx_B;
-  uint32_t B_addr = __cvta_generic_to_shared(B_row);
-  uint32_t B_frag[2];
-  asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 "
-               "{%0, %1}, [%2];\n"
-               : "=r"(B_frag[0]), "=r"(B_frag[1])
-               : "r"(B_addr));
-  asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
-               "{%0, %1, %2, %3}, "         // D (output)
-               "{%4, %5, %6, %7}, " // A
-               "{%8, %9}, "         // B
-               "{%0, %1, %2, %3};\n"        // C (same regs as D)
-               : "+r"(C_frag[0]), "+r"(C_frag[1]), "+r"(C_frag[2]) ,"+r"(C_frag[3]) 
-               : "r"(A_frag[0]), "r"(A_frag[2]), "r"(A_frag[1]), // permute A here it needs to b passed col major
-                 "r"(A_frag[3]), "r"(B_frag[0]), "r"(B_frag[1]));
+  const int widx = threadIdx.x / WARP_SIZE;
+  constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
+  constexpr int MMA_M = 16;
+  constexpr int MMA_N = 8;
+  constexpr int MMA_K = 16;
+  constexpr int C_M = M / MMA_M;
+  constexpr int C_N = N / MMA_N;
+  for (int k = 0; k < K; k += MMA_K) {
+    for (int m = 0; m < C_M; m++) {
+      int a0 = m * MMA_M * LDA + k;
+      int idx_A = (tidx % 8) * LDA + (tidx / 16) * LDA * 8 +
+                        ((tidx / 8) % 2) * 8;
+      half *A_row = A_s + a0 + idx_A;
+      uint32_t A_addr = __cvta_generic_to_shared(A_row);
+      uint32_t A_frag[4];
+      asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, "
+                   "%3}, [%4];\n"
+                   : "=r"(A_frag[0]), "=r"(A_frag[1]), "=r"(A_frag[2]),
+                     "=r"(A_frag[3])
+                   : "r"(A_addr));
+      for (int n = 0; n < C_N; n += NUM_WARPS) {
+        int b0 = k * LDB  + (n * MMA_N) + MMA_N * widx;
+        int idx_B = (tidx % 16) * LDB;
+        half *B_row = B_s + b0 + idx_B;
+        uint32_t B_addr = __cvta_generic_to_shared(B_row);
+        uint32_t B_frag[2];
+        asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 "
+                     "{%0, %1}, [%2];\n"
+                     : "=r"(B_frag[0]), "=r"(B_frag[1])
+                     : "r"(B_addr));
+        int c0 = m * (C_N * 4) + (n + widx) * 4;
+        asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                     "{%0, %1, %2, %3}, "         // D (output)
+                     "{%4, %5, %6, %7}, " // A
+                     "{%8, %9}, "         // B
+                     "{%0, %1, %2, %3};\n"        // C (same regs as D)
+                     : "+r"(C_frag[c0]), "+r"(C_frag[c0 + 1]), "+r"(C_frag[c0 + 2]) ,"+r"(C_frag[c0 + 3]) 
+                     : "r"(A_frag[0]), "r"(A_frag[2]), "r"(A_frag[1]), // permute A here it needs to b passed col major
+                       "r"(A_frag[3]), "r"(B_frag[0]), "r"(B_frag[1]));
+      }
+    }
+  }
+}
+
+template<int M, int N, int K, int LDA, int LDB, int NUM_THREADS>
+__device__ void _mma_sync_smem_smem_reg_m_dist(half *__restrict A_s, half *__restrict  B_s,
+                                               uint32_t *__restrict C_frag) {
+  const int tidx = threadIdx.x % WARP_SIZE;
+  const int widx = threadIdx.x / WARP_SIZE;
+  
+  constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
+  constexpr int MMA_M = 16;
+  constexpr int MMA_N = 8;
+  constexpr int MMA_K = 16;
+  
+  constexpr int C_M = M / (MMA_M * NUM_WARPS);
+  constexpr int C_N = N / MMA_N;
+
+  for (int k = 0; k < K; k += MMA_K) {
+    #pragma unroll
+    for (int m = 0; m < C_M; m++) {
+      int a0 = m * widx * MMA_M * LDA + k;
+      int idx_A = (tidx % 8) * LDA + (tidx / 16) * LDA * 8 + ((tidx / 8) % 2) * 8;
+      half *A_row = A_s + a0 + idx_A;
+      
+      uint32_t A_addr = __cvta_generic_to_shared(A_row);
+      uint32_t A_frag[4];
+      
+      asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                   : "=r"(A_frag[0]), "=r"(A_frag[1]), "=r"(A_frag[2]), "=r"(A_frag[3])
+                   : "r"(A_addr));
+      #pragma unroll
+      for (int n = 0; n < C_N; n++) {
+        int b0 = k * LDB + n * MMA_N; 
+        int idx_B = (tidx % 16) * LDB;
+        half *B_row = B_s + b0 + idx_B;
+        
+        uint32_t B_addr = __cvta_generic_to_shared(B_row);
+        uint32_t B_frag[2];
+        
+        asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0, %1}, [%2];\n"
+                     : "=r"(B_frag[0]), "=r"(B_frag[1])
+                     : "r"(B_addr));
+
+        int c0 = m * (C_N * 4) + n * 4;
+        asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                     "{%0, %1, %2, %3}, "     // D
+                     "{%4, %5, %6, %7}, "     // A
+                     "{%8, %9}, "             // B
+                     "{%0, %1, %2, %3};\n"    // C
+                     : "+r"(C_frag[c0]), "+r"(C_frag[c0 + 1]), 
+                       "+r"(C_frag[c0 + 2]), "+r"(C_frag[c0 + 3])
+                     : "r"(A_frag[0]), "r"(A_frag[2]), "r"(A_frag[1]), "r"(A_frag[3]), // Permuted A
+                       "r"(B_frag[0]), "r"(B_frag[1]));
+      }
+    }
+  }
 }
 
 template <int TILE_M, int TILE_N, int TILE_K, int NUM_THREADS>
@@ -49,15 +122,22 @@ __global__ void matmul(half *A, half *B, float *C, int M, int N, int K) {
   const int widx = threadIdx.x / WARP_SIZE;
   constexpr int MMA_M = 16;
   constexpr int MMA_N = 8;
-  constexpr int C_M = TILE_M / MMA_M;
+  constexpr int C_M = TILE_M / (MMA_M * NUM_WARPS);
   constexpr int C_N = TILE_N / MMA_N;
   constexpr int LDA = (TILE_K + 8);
   constexpr int LDB = (TILE_N + 8);
+  constexpr int LDC = (TILE_N + 4);
   // we have to further divide the thread ids so we can also distribute them across M
   const int gidx = tidx / GROUP_SIZE;
-  const int lidx = tidx % GROUP_SIZE;
-  __shared__ __align__(16) half A_s[TILE_M * LDA];
-  __shared__ __align__(16) half B_s[TILE_K * LDB];
+  const int lidx = tidx % GROUP_SIZE; 
+  constexpr int A_size = TILE_M * LDA * 2;  
+  constexpr int B_size = TILE_K * LDB * 2;  
+  constexpr int C_size = MMA_M * NUM_WARPS * LDC * 4; // we only have to keep one chunk of M in shmem at once  
+  constexpr int AB_size = A_size + B_size;
+  constexpr int smem_size = (AB_size > C_size) ? AB_size : C_size;
+  __shared__ __align__(16) uint8_t smem[smem_size];
+  half *A_s = reinterpret_cast<half*>(smem);
+  half *B_s = reinterpret_cast<half*>(smem + A_size);
   uint32_t C_frag[C_M][C_N][4] = {0};
 
 
@@ -82,32 +162,29 @@ __global__ void matmul(half *A, half *B, float *C, int M, int N, int K) {
 
     __syncthreads();
 
-    for (int kk = 0; kk < TILE_K; kk += MMA_M) {
-      for (int mm = 0; mm < C_M; mm++) {
-        for (int nn = 0; nn < C_N; nn += NUM_WARPS) {
-          int a0 = mm * MMA_M * LDA + kk;
-          int b0 = kk * LDB + (nn * MMA_N) + MMA_N * widx;
-          mma_m16n8k16<LDA, LDB, NUM_THREADS>(A_s + a0, B_s + b0, C_frag[mm][nn + widx]);
-        }
-      }
-
-    }
+    _mma_sync_smem_smem_reg_m_dist<TILE_M, TILE_N, TILE_K, LDA, LDB, NUM_THREADS>(A_s, B_s, reinterpret_cast<uint32_t*>(C_frag));
 
     __syncthreads();
-    for (int mm = 0; mm < C_M; mm++) {
-      for (int nn = 0; nn < C_N; nn += NUM_WARPS) {
+  }
+
+  uint32_t *C_s = reinterpret_cast<uint32_t*>(smem);
+  for (int mm = 0; mm < C_M; mm++) {
+      for (int nn = 0; nn < C_N; nn++) {
         int row_id = tidx / 4;
         int col_id = tidx % 4;
-        int c0 = (m + mm * MMA_M) * N + n + (nn * MMA_N) + widx * MMA_N; 
-        int idx = c0 + row_id * N + col_id * 2;
-        *reinterpret_cast<uint32_t*>(&C[idx]) = C_frag[mm][nn + widx][0];
-        *reinterpret_cast<uint32_t*>(&C[idx+1]) = C_frag[mm][nn + widx][1];
-        idx = c0 + (8 + row_id) * N + col_id * 2;
-        *reinterpret_cast<uint32_t*>(&C[idx]) = C_frag[mm][nn + widx][2];
-        *reinterpret_cast<uint32_t*>(&C[idx+1]) = C_frag[mm][nn + widx][3];
+        int c0 = widx * MMA_M * LDC + (nn * MMA_N); 
+        int idx = c0 + row_id * LDC + col_id * 2;
+        C_s[idx] = C_frag[mm][nn][0];
+        C_s[idx+1] = C_frag[mm][nn][1];
+        idx = c0 + (8 + row_id) * LDC + col_id * 2;
+        C[idx] = C_frag[mm][nn][2];
+        C[idx+1] = C_frag[mm][nn][3];
+      }
+      for (int nn = 0; nn < TILE_N; nn += GROUP_SIZE * 4) {
+        *reinterpret_cast<int4*>(&C[(m + (mm * MMA_M * NUM_WARPS) + widx * NUM_GROUPS + gidx) * N + n + nn + lidx * 4]) =
+            *reinterpret_cast<int4*>(&C_s[(widx * NUM_GROUPS + gidx) * LDC + nn + lidx * 4]);
       }
     }
-  }
 }
 
 template <int TILE_M, int TILE_N, int TILE_K, int NUM_THREADS>
@@ -337,12 +414,11 @@ void validate_matmul(int M, int N, int K) {
 }
 
 int main() {
-  // after vectorzing all loads and stores 128bit 
-  const int M = 16, K = 64, N = 64;
-  constexpr int TILE_M = 16, TILE_K = 64, TILE_N = 64;
-  constexpr int num_threads = 128;
+  const int M = 1024, K = 1024, N = 1024;
+  constexpr int TILE_M = 256, TILE_K = 64, TILE_N = 128;
+  constexpr int num_threads = 256;
   validate_matmul<TILE_M, TILE_N, TILE_K, num_threads>(M, N, K);
-  // benchmark_matmul<TILE_M,TILE_N, TILE_K, num_threads>(M, N, K);
+  benchmark_matmul<TILE_M,TILE_N, TILE_K, num_threads>(M, N, K);
 
 
   // half *h_A = new half[M * K];
