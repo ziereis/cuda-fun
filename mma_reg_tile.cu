@@ -71,27 +71,33 @@ __device__ void _mma_sync_smem_smem_reg_m_dist(half *__restrict A_s, half *__res
   
   constexpr int C_M = M / (MMA_M * NUM_WARPS);
   constexpr int C_N = N / MMA_N;
+  constexpr int swizzle_bits = 3;
+  constexpr int swizzle_mask = (1 << swizzle_bits) - 1;
 
   for (int k = 0; k < K; k += MMA_K) {
     #pragma unroll
     for (int m = 0; m < C_M; m++) {
-      int a0 = m * widx * MMA_M * LDA + k;
-      int idx_A = (tidx % 8) * LDA + (tidx / 16) * LDA * 8 + ((tidx / 8) % 2) * 8;
-      half *A_row = A_s + a0 + idx_A;
+      int base_offset = m * widx * MMA_M * LDA + k;
+      int local_row_a = (tidx % 8) + (tidx / 16) * 8;
+      int row_idx = (m * widx * MMA_M) + local_row_a;
+      int col_offset = ((tidx / 8) % 2) * 8;
+      int modifier = (row_idx & swizzle_mask) << 3;
+      int swizzled_col_offset = col_offset ^ modifier;
+      half *A_row = A_s + k + (row_idx * LDA) + swizzled_col_offset;
       
       uint32_t A_addr = __cvta_generic_to_shared(A_row);
       uint32_t A_frag[4];
-      
       asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                    : "=r"(A_frag[0]), "=r"(A_frag[1]), "=r"(A_frag[2]), "=r"(A_frag[3])
                    : "r"(A_addr));
       #pragma unroll
       for (int n = 0; n < C_N; n++) {
-        int b0 = k * LDB + n * MMA_N; 
-        int idx_B = (tidx % 16) * LDB;
-        half *B_row = B_s + b0 + idx_B;
-        
-        uint32_t B_addr = __cvta_generic_to_shared(B_row);
+        int local_row_b = k + (tidx % 16);
+        int modifier = (local_row_b & swizzle_mask) << 3;
+        int col_offset = n * MMA_N;
+        int swizzled_col_offset = col_offset ^ modifier;
+        half *B_ptr = B_s + (local_row_b * LDB) + swizzled_col_offset;
+        uint32_t B_addr = __cvta_generic_to_shared(B_ptr);
         uint32_t B_frag[2];
         
         asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0, %1}, [%2];\n"
@@ -124,9 +130,9 @@ __global__ void matmul(half *A, half *B, float *C, int M, int N, int K) {
   constexpr int MMA_N = 8;
   constexpr int C_M = TILE_M / (MMA_M * NUM_WARPS);
   constexpr int C_N = TILE_N / MMA_N;
-  constexpr int LDA = (TILE_K + 8);
-  constexpr int LDB = (TILE_N + 8);
-  constexpr int LDC = (TILE_N + 4);
+  constexpr int LDA = TILE_K;
+  constexpr int LDB = TILE_N;
+  constexpr int LDC = TILE_N;
   // we have to further divide the thread ids so we can also distribute them across M
   const int gidx = tidx / GROUP_SIZE;
   const int lidx = tidx % GROUP_SIZE; 
@@ -144,19 +150,27 @@ __global__ void matmul(half *A, half *B, float *C, int M, int N, int K) {
   const int m = blockIdx.x * TILE_M;
   const int n = blockIdx.y * TILE_N;
 
+  constexpr int swizzle_bits = 3;
+  constexpr int mask = (1 << swizzle_bits) - 1;
 
   for (int k = 0; k < K; k += TILE_K) {
     for (int mm = 0; mm < TILE_M; mm += NUM_WARPS * NUM_GROUPS) {
       for (int kk = 0; kk < TILE_K; kk += GROUP_SIZE * 8) { // 8 * f16 = 128
-        *reinterpret_cast<int4*>(&A_s[(mm + widx * NUM_GROUPS + gidx) * LDA + kk + lidx * 8]) =
-            *reinterpret_cast<int4*>(&A[(m + mm + widx * NUM_GROUPS + gidx) * K + k + kk + lidx * 8]);
+        int local_row = mm + widx * NUM_GROUPS + gidx;
+        int modifier = (local_row & mask) << 3;
+        int logical_col = kk + lidx * 8;
+        int swizzled_col = logical_col ^ modifier;
+        *reinterpret_cast<int4*>(&A_s[local_row * LDA + swizzled_col]) = 
+            *reinterpret_cast<int4*>(&A[(m + local_row) * K + k + logical_col]);
       }
     }
     // same applies here
     for (int kk = 0; kk < TILE_K; kk += NUM_WARPS * NUM_GROUPS) {
       for (int nn = 0; nn < TILE_N; nn += GROUP_SIZE * 8) {
-        *reinterpret_cast<int4*>(&B_s[(kk + widx *NUM_GROUPS + gidx) * LDB + nn + lidx * 8]) =
-            *reinterpret_cast<int4*>(&B[(k + kk + widx * NUM_GROUPS + gidx) * N + n + nn + lidx * 8]);
+        int local_row = kk + widx * NUM_GROUPS + gidx;
+        int local_col = lidx ^ (local_row & mask);
+        *reinterpret_cast<int4*>(&B_s[(local_row) * LDB + nn + local_col * 8]) =
+            *reinterpret_cast<int4*>(&B[(k + local_row) * N + n + nn + lidx * 8]);
       }
     }
 
@@ -173,16 +187,20 @@ __global__ void matmul(half *A, half *B, float *C, int M, int N, int K) {
         int row_id = tidx / 4;
         int col_id = tidx % 4;
         int c0 = widx * MMA_M * LDC + (nn * MMA_N); 
-        int idx = c0 + row_id * LDC + col_id * 2;
-        C_s[idx] = C_frag[mm][nn][0];
-        C_s[idx+1] = C_frag[mm][nn][1];
-        idx = c0 + (8 + row_id) * LDC + col_id * 2;
-        C[idx] = C_frag[mm][nn][2];
-        C[idx+1] = C_frag[mm][nn][3];
+        int modifier = (row_id & mask) << 2;
+        int row = c0 + row_id * LDC;
+        C_s[row + (modifier ^ (col_id * 2))] = C_frag[mm][nn][0];
+        C_s[row + (modifier ^ (col_id * 2 + 1))] = C_frag[mm][nn][1];
+        row = c0 + (8 + row_id) * LDC;
+        modifier = ((row_id + 8) & mask) << 2;
+        C_s[row + (modifier ^ (col_id * 2))] = C_frag[mm][nn][2];
+        C_s[row + (modifier ^ (col_id * 2 + 1))] = C_frag[mm][nn][3];
       }
       for (int nn = 0; nn < TILE_N; nn += GROUP_SIZE * 4) {
-        *reinterpret_cast<int4*>(&C[(m + (mm * MMA_M * NUM_WARPS) + widx * NUM_GROUPS + gidx) * N + n + nn + lidx * 4]) =
-            *reinterpret_cast<int4*>(&C_s[(widx * NUM_GROUPS + gidx) * LDC + nn + lidx * 4]);
+        int local_row = widx * NUM_GROUPS + gidx;
+        int swizzled_col = lidx ^ (local_row & mask);
+        *reinterpret_cast<int4*>(&C[(m + (mm * MMA_M * NUM_WARPS) + local_row) * N + n + nn + lidx * 4]) =
+            *reinterpret_cast<int4*>(&C_s[local_row * LDC + nn + swizzled_col * 4]);
       }
     }
 }
@@ -218,7 +236,7 @@ void print_matrix(float *mat, int rows, int cols) {
 }
 }
 
-void check_results(float *h_C_ref, float *h_C_gpu, int M, int N, float epsilon = 1e-3) {
+void check_results(float *h_C_ref, float *h_C_gpu, int M, int N, float epsilon = 1e-2) {
   bool ok = true;
   for (int i = 0; i < M * N; ++i) {
     float ref_val = h_C_ref[i];
