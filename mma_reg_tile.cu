@@ -73,23 +73,25 @@ __device__ void _mma_sync_smem_smem_reg_m_dist(half *__restrict A_s, half *__res
   constexpr int C_N = N / MMA_N;
   constexpr int swizzle_bits = 3;
   constexpr int swizzle_mask = (1 << swizzle_bits) - 1;
-
+  #pragma unroll
   for (int k = 0; k < K; k += MMA_K) {
     #pragma unroll
     for (int m = 0; m < C_M; m++) {
       int local_row_a = (tidx % 8) + (tidx / 16) * 8;
       int row_idx = (m * NUM_WARPS + widx) * MMA_M + local_row_a;
       int logical_col = k + ((tidx / 8) % 2) * 8;
-      // int modifier = (row_idx & swizzle_mask) << 3;
-      // int swizzled_col = logical_col ^ modifier;
-      half *A_row = A_s + (row_idx * LDA) + logical_col;
+      int modifier = (row_idx & swizzle_mask) << 3;
+      int swizzled_col = logical_col ^ modifier;
+      half *A_row = A_s + (row_idx * LDA) + swizzled_col;
       
       uint32_t A_addr = __cvta_generic_to_shared(A_row);
       uint32_t A_frag[4];
-      
       asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                    : "=r"(A_frag[0]), "=r"(A_frag[1]), "=r"(A_frag[2]), "=r"(A_frag[3])
                    : "r"(A_addr));
+
+
+
       #pragma unroll
       for (int n = 0; n < C_N; n++) {
         int local_row_b = tidx % 16;
@@ -121,10 +123,10 @@ __device__ void _mma_sync_smem_smem_reg_m_dist(half *__restrict A_s, half *__res
   }
 }
 
-template <int TILE_M, int TILE_N, int TILE_K, int NUM_THREADS, int NUM_STAGES = 4>
+template <int TILE_M, int TILE_N, int TILE_K, int NUM_THREADS, int NUM_STAGES = 3>
 __global__ void matmul(half *A, half *B, float *C, int M, int N, int K) {
   constexpr int GROUP_SIZE = 8;
-  constexpr int GROUP_SIZE_A = 4;
+  constexpr int GROUP_SIZE_A = 8;
   constexpr int NUM_GROUPS = WARP_SIZE / GROUP_SIZE;
   constexpr int NUM_GROUPS_A = WARP_SIZE / GROUP_SIZE_A;
   constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
@@ -134,9 +136,9 @@ __global__ void matmul(half *A, half *B, float *C, int M, int N, int K) {
   constexpr int MMA_N = 8;
   constexpr int C_M = TILE_M / (MMA_M * NUM_WARPS);
   constexpr int C_N = TILE_N / MMA_N;
-  constexpr int LDA = (TILE_K + 8);
+  constexpr int LDA = TILE_K;
   constexpr int LDB = TILE_N;
-  constexpr int LDC = (TILE_N + 4);
+  constexpr int LDC = TILE_N;
   // we have to further divide the thread ids so we can also distribute them across M
   const int gidx = tidx / GROUP_SIZE;
   const int lidx = tidx % GROUP_SIZE; 
@@ -166,11 +168,11 @@ __global__ void matmul(half *A, half *B, float *C, int M, int N, int K) {
     for (int mm = 0; mm < TILE_M; mm += NUM_WARPS * NUM_GROUPS_A) {
       for (int kk = 0; kk < TILE_K; kk += GROUP_SIZE_A * 8) {
         int local_row = mm + widx * NUM_GROUPS_A + gidx_a;
-        // int modifier = (local_row & mask) << 3;
+        int modifier = (local_row & mask) << 3;
         int logical_col = kk + lidx_a * 8;
-        // int swizzled_col = logical_col ^ modifier;
+        int swizzled_col = logical_col ^ modifier;
         uint32_t smem_addr = __cvta_generic_to_shared(
-            &A_dst[local_row * LDA + logical_col]);
+            &A_dst[local_row * LDA + swizzled_col]);
         const half* gmem_addr = &A[(m + local_row) * K + k + logical_col];
         asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(smem_addr), "l"(gmem_addr));
       }
@@ -471,8 +473,8 @@ void validate_matmul(int M, int N, int K) {
 }
 
 int main() {
-  const int M = 1024, K = 1024, N = 1024;
-  constexpr int TILE_M = 128, TILE_K = 32, TILE_N = 128;
+  const int M = 2*1024, K = 2*1024, N = 2*1024;
+  constexpr int TILE_M = 128, TILE_K = 64, TILE_N = 128;
   constexpr int num_threads = 256;
   validate_matmul<TILE_M, TILE_N, TILE_K, num_threads>(M, N, K);
   benchmark_matmul<TILE_M,TILE_N, TILE_K, num_threads>(M, N, K);
