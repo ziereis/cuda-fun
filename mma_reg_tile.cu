@@ -59,6 +59,138 @@ __device__ void _mma_sync_smem_smem_reg_n_dist(half *__restrict A_s, half *__res
 }
 
 template<int M, int N, int K, int LDA, int LDB, int NUM_THREADS>
+__device__ void _mma_sync_smem_smem_reg_m_dist_manual_load(half *__restrict A_s, half *__restrict  B_s,
+                                               uint32_t *__restrict C_frag) {
+  const int tidx = threadIdx.x % WARP_SIZE;
+  const int widx = threadIdx.x / WARP_SIZE;
+  
+  constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
+  constexpr int MMA_M = 16;
+  constexpr int MMA_N = 8;
+  constexpr int MMA_K = 16;
+  
+  constexpr int C_M = M / (MMA_M * NUM_WARPS);
+  constexpr int C_N = N / MMA_N;
+  constexpr int swizzle_bits = 3;
+  constexpr int swizzle_mask = (1 << swizzle_bits) - 1;
+  #pragma unroll
+  for (int k = 0; k < K; k += MMA_K) {
+    #pragma unroll
+    for (int m = 0; m < C_M; m++) {
+      // int local_row_a = (tidx % 8) + (tidx / 16) * 8;
+      // int row_idx = (m * NUM_WARPS + widx) * MMA_M + local_row_a;
+      // int logical_col = k + ((tidx / 8) % 2) * 8;
+      // int modifier = (row_idx & swizzle_mask) << 3;
+      // int swizzled_col = logical_col ^ modifier;
+      // half *A_row = A_s + (row_idx * LDA) + swizzled_col;
+      //
+      // uint32_t A_addr = __cvta_generic_to_shared(A_row);
+      // uint32_t A_frag[4];
+      // asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+      //              : "=r"(A_frag[0]), "=r"(A_frag[1]), "=r"(A_frag[2]), "=r"(A_frag[3])
+      //              : "r"(A_addr));
+      int global_row = (m * NUM_WARPS + widx) * MMA_M;
+      uint32_t A_frag[4];
+      {
+        int local_row = (tidx / 4);
+        int row_idx = global_row + local_row;
+        int logical_col = k + (tidx %4) * 2;
+        int modifier = (row_idx & swizzle_mask) << 3;
+        int swizzled_col = logical_col ^ modifier;
+        A_frag[0] = *((uint32_t*)(A_s + (row_idx * LDA) + swizzled_col));
+      }
+      {
+        int local_row = (tidx / 4);
+        int row_idx = global_row + local_row;
+        int logical_col = k + 8 + (tidx %4) * 2;
+        int modifier = (row_idx & swizzle_mask) << 3;
+        int swizzled_col = logical_col ^ modifier;
+        A_frag[1] = *((uint32_t*)(A_s + (row_idx * LDA) + swizzled_col));
+      }
+      {
+        int local_row = (tidx / 4) + 8;
+        int row_idx = global_row + local_row;
+        int logical_col =  k + (tidx %4) * 2;
+        int modifier = (row_idx & swizzle_mask) << 3;
+        int swizzled_col = logical_col ^ modifier;
+        A_frag[2] = *((uint32_t*)(A_s + (row_idx * LDA) + swizzled_col));
+      }
+      {
+        int local_row = (tidx / 4) + 8;
+        int row_idx = global_row + local_row;
+        int logical_col =  k + 8 + (tidx %4) * 2;
+        int modifier = (row_idx & swizzle_mask) << 3;
+        int swizzled_col = logical_col ^ modifier;
+        A_frag[3] = *((uint32_t*)(A_s + (row_idx * LDA) + swizzled_col));
+      }
+
+
+      #pragma unroll
+      for (int n = 0; n < C_N; n++) {
+        // int local_row_b = tidx % 16;
+        // int row_idx_b = k + local_row_b;
+        // int logical_col_b = n * MMA_N;
+        // int modifier_b = (row_idx_b & swizzle_mask) << 3;
+        // int swizzled_col_b = logical_col_b ^ modifier_b;
+        // half *B_row = B_s + (row_idx_b * LDB) + swizzled_col_b;
+        //
+        // uint32_t B_addr = __cvta_generic_to_shared(B_row);
+        // uint32_t B_frag[2];
+        //
+        // asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0, %1}, [%2];\n"
+        //              : "=r"(B_frag[0]), "=r"(B_frag[1])
+        //              : "r"(B_addr));
+        half B_frag[4];
+        {
+          int local_row = (tidx % 4) * 2;
+          int row_idx = k + local_row;
+          int logical_col = n * MMA_N + (tidx /4);
+          int modifier = (row_idx & swizzle_mask) << 3;
+          int swizzled_col = logical_col ^ modifier;
+          B_frag[0] = B_s[row_idx * LDB + swizzled_col];
+        }
+        {
+          int local_row = (tidx % 4) * 2 + 1;
+          int row_idx = k + local_row;
+          int logical_col = n * MMA_N + (tidx /4);
+          int modifier = (row_idx & swizzle_mask) << 3;
+          int swizzled_col = logical_col ^ modifier;
+          B_frag[1] = B_s[row_idx * LDB + swizzled_col];
+        }
+        {
+          int local_row = 8 + (tidx % 4) * 2;
+          int row_idx = k + local_row;
+          int logical_col = n  * MMA_N + (tidx /4);
+          int modifier = (row_idx & swizzle_mask) << 3;
+          int swizzled_col = logical_col ^ modifier;
+          B_frag[2] = B_s[row_idx * LDB + swizzled_col];
+        }
+        {
+          int local_row = 8 + (tidx % 4) * 2 + 1;
+          int row_idx = k + local_row;
+          int logical_col = n  * MMA_N + (tidx /4);
+          int modifier = (row_idx & swizzle_mask) << 3;
+          int swizzled_col = logical_col ^ modifier;
+          B_frag[3] = B_s[row_idx * LDB + swizzled_col];
+        }
+
+        int c0 = m * (C_N * 4) + n * 4;
+        asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                     "{%0, %1, %2, %3}, "     // D
+                     "{%4, %5, %6, %7}, "     // A
+                     "{%8, %9}, "             // B
+                     "{%0, %1, %2, %3};\n"    // C
+                     : "+r"(C_frag[c0]), "+r"(C_frag[c0 + 1]), 
+                       "+r"(C_frag[c0 + 2]), "+r"(C_frag[c0 + 3])
+                     : "r"(A_frag[0]), "r"(A_frag[2]), "r"(A_frag[1]), "r"(A_frag[3]), // Permuted A
+                       "r"(*reinterpret_cast<uint32_t*>(B_frag)), "r"(*reinterpret_cast<uint32_t*>(B_frag + 2)));
+      }
+    }
+  }
+}
+
+
+template<int M, int N, int K, int LDA, int LDB, int NUM_THREADS>
 __device__ void _mma_sync_smem_smem_reg_m_dist(half *__restrict A_s, half *__restrict  B_s,
                                                uint32_t *__restrict C_frag) {
   const int tidx = threadIdx.x % WARP_SIZE;
@@ -83,14 +215,12 @@ __device__ void _mma_sync_smem_smem_reg_m_dist(half *__restrict A_s, half *__res
       int modifier = (row_idx & swizzle_mask) << 3;
       int swizzled_col = logical_col ^ modifier;
       half *A_row = A_s + (row_idx * LDA) + swizzled_col;
-      
+
       uint32_t A_addr = __cvta_generic_to_shared(A_row);
       uint32_t A_frag[4];
       asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                    : "=r"(A_frag[0]), "=r"(A_frag[1]), "=r"(A_frag[2]), "=r"(A_frag[3])
                    : "r"(A_addr));
-
-
 
       #pragma unroll
       for (int n = 0; n < C_N; n++) {
@@ -100,10 +230,10 @@ __device__ void _mma_sync_smem_smem_reg_m_dist(half *__restrict A_s, half *__res
         int modifier_b = (row_idx_b & swizzle_mask) << 3;
         int swizzled_col_b = logical_col_b ^ modifier_b;
         half *B_row = B_s + (row_idx_b * LDB) + swizzled_col_b;
-        
+
         uint32_t B_addr = __cvta_generic_to_shared(B_row);
         uint32_t B_frag[2];
-        
+
         asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0, %1}, [%2];\n"
                      : "=r"(B_frag[0]), "=r"(B_frag[1])
                      : "r"(B_addr));
@@ -355,7 +485,7 @@ void benchmark_matmul(int M, int N, int K, int num_iterations = 100) {
   cudaEventCreate(&stop);
 
   cudaEventRecord(start);
-  for (int i = 0; i < num_iterations; ++i) {
+  for (int i = 0; i < 10; ++i) {
     cuda_matmul<TILE_M, TILE_N, TILE_K, NUM_THREADS>(d_A, d_B, d_C_custom, M, N, K);
   }
   cudaEventRecord(stop);
@@ -367,7 +497,7 @@ void benchmark_matmul(int M, int N, int K, int num_iterations = 100) {
 
   // Benchmark cuBLAS
   cudaEventRecord(start);
-  for (int i = 0; i < num_iterations; ++i) {
+  for (int i = 0; i < 10; ++i) {
     cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N,
                  N, M, K,
                  &alpha,
@@ -473,10 +603,10 @@ void validate_matmul(int M, int N, int K) {
 }
 
 int main() {
-  const int M = 4*1024, K = 4*1024, N = 4*1024;
+  const int M = 1024, K = 1024, N = 1024;
   constexpr int TILE_M = 128, TILE_K = 64, TILE_N = 128;
   constexpr int num_threads = 256;
-  // validate_matmul<TILE_M, TILE_N, TILE_K, num_threads>(M, N, K);
+  validate_matmul<TILE_M, TILE_N, TILE_K, num_threads>(M, N, K);
   benchmark_matmul<TILE_M,TILE_N, TILE_K, num_threads>(M, N, K);
 
 
