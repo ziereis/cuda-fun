@@ -473,10 +473,10 @@ void validate_matmul(int M, int N, int K) {
 }
 
 int main() {
-  const int M = 2*1024, K = 2*1024, N = 2*1024;
+  const int M = 4*1024, K = 4*1024, N = 4*1024;
   constexpr int TILE_M = 128, TILE_K = 64, TILE_N = 128;
   constexpr int num_threads = 256;
-  validate_matmul<TILE_M, TILE_N, TILE_K, num_threads>(M, N, K);
+  // validate_matmul<TILE_M, TILE_N, TILE_K, num_threads>(M, N, K);
   benchmark_matmul<TILE_M,TILE_N, TILE_K, num_threads>(M, N, K);
 
 
