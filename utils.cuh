@@ -37,7 +37,7 @@ void check_results(float *h_C_ref, float *h_C_gpu, int M, int N, float epsilon =
 }
 
 template<typename Fn>
-void validate_matmul(Fn matmul_kernel, int M, int N, int K) {
+void validate_matmul(Fn matmul_kernel, int M, int N, int K, float epsilon = 1e-3) {
   half *h_A_rand = new half[M * K];
   half *h_B_rand = new half[K * N];
   float *h_C_ref = new float[M * N];
@@ -73,7 +73,7 @@ void validate_matmul(Fn matmul_kernel, int M, int N, int K) {
 
   cudaMemcpy(h_C_gpu, d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost);
 
-  check_results(h_C_ref, h_C_gpu, M, N);
+  check_results(h_C_ref, h_C_gpu, M, N, epsilon);
 
   delete[] h_A_rand;
   delete[] h_B_rand;
