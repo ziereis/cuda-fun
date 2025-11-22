@@ -75,7 +75,6 @@ nvcc  -lcublas -arch=sm_86 -O3 10_pipelining_with_swizzling.cu -o main && ./main
 105 % of cublas performance
 
 ## [Software pipelining/shared memory swizzling/C shared memory staging][11_pipeling_swizzling_c_smem_staging.cu]
-`11_pipelining_with_swizzling.cu`
 Software pipeling + shared memory swizzling + C shared memory staging. This is the kernel with the highest performance.
 
 ```
@@ -84,7 +83,6 @@ nvcc  -lcublas -arch=sm_86 -O3 11_pipelining_with_swizzling.cu -o main && ./main
 120 % of cublas performance
 
 ## [BONUS: how much performance do we lose by not using the ldmatrix PTX instructions?][12_fastest_without_ldmatrix.cu]
-`12_fastest_without_ldmatrix.cu` 
 Takes fastest implementation and replaces usage of the ldmatrix PTX instruction by manually reading the matrix fragments from shared memory.
 
 ```
