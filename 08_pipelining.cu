@@ -183,9 +183,9 @@ void matmul(half *A, half *B, float *C, int M, int N, int K) {
 // Speedup:        0.97x (slower)
 // =======================================
 int main() {
-  constexpr int TILE_M = 128, TILE_N = 128, TILE_K = 64;
+  constexpr int TILE_M = 128, TILE_N = 64, TILE_K = 64;
   constexpr int NUM_THREADS = 256;
-  const int M = 4*1024, N = 4*1024, K = 4*1024;
-  // validate_matmul(matmul<TILE_M, TILE_N, TILE_K, NUM_THREADS, 3>, M, N, K, 1e-2);
+  const int M = 1024, N = 1024, K = 1024;
+  validate_matmul(matmul<TILE_M, TILE_N, TILE_K, NUM_THREADS, 2>, M, N, K, 1e-2);
   benchmark_matmul(matmul<TILE_M, TILE_N, TILE_K, NUM_THREADS, 2>, M, N, K);
 }

@@ -77,7 +77,9 @@ __global__ void matmul_kernel(half *A, half *B, float *C) {
   for (int i = 0; i < K * N; i+= NUM_THREADS){
     B_s[i + tidx] = B[i + tidx];
   }
+  __syncthreads();
   mma(A_s,B_s, C_s);
+  __syncthreads();
   for (int i = 0; i < M * N; i+= NUM_THREADS){
     C[i + tidx] = C_s[i + tidx];
   }

@@ -61,6 +61,7 @@ __global__ void matmul_kernel(half *A, half *B, float *C, int M, int N, int K) {
   constexpr int NUM_GROUPS = WARP_SIZE / GROUP_SIZE;
   constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
   constexpr int VEC_SIZE_HALF = 8;  // int4 = 8 halves (16 bytes)
+  constexpr int VEC_SIZE_FLOAT = 4;  // int4 = 8 halves (16 bytes)
   
   const int tidx = threadIdx.x % WARP_SIZE;
   const int widx = threadIdx.x / WARP_SIZE;
@@ -130,10 +131,10 @@ __global__ void matmul_kernel(half *A, half *B, float *C, int M, int N, int K) {
       C_s[row1 * LDC + smem_col_base + col0] = C_frag[mm][nn][2];
       C_s[row1 * LDC + smem_col_base + col1] = C_frag[mm][nn][3];
     }
-    for (int row = 0; row < MMA_M; row++) {
-      for (int nn = 0; nn < TILE_N; nn += WARP_SIZE * 4) {
-        int local_row = widx * MMA_M + row;
-        int local_col = nn + tidx * 4;
+    for (int row = 0; row < MMA_M; row+= NUM_GROUPS) {
+      for (int nn = 0; nn < TILE_N; nn += GROUP_SIZE * VEC_SIZE_FLOAT) {
+        int local_row = row + widx * MMA_M + gidx;
+        int local_col = nn + lidx * VEC_SIZE_FLOAT;
         int global_row = m + mm * MMA_M * NUM_WARPS + local_row;
         int global_col = n + local_col;
         *reinterpret_cast<int4*>(C + global_row * N + global_col) =
@@ -165,15 +166,15 @@ void matmul(half *A, half *B, float *C, int M, int N, int K) {
 // Matrix dimensions: M=1024, N=1024, K=1024
 // Iterations: 100
 //
-// Custom Kernel:  0.1132 ms  (18.97 TFLOPS)
-// cuBLAS:         0.0816 ms  (26.31 TFLOPS)
-// Efficiency:     72.10%
-// Speedup:        0.72x (slower)
+// Custom Kernel:  0.0815 ms  (26.35 TFLOPS)
+// cuBLAS:         0.0845 ms  (25.42 TFLOPS)
+// Efficiency:     103.66%
+// Speedup:        1.04x (faster)
 // =======================================
 int main() {
-  constexpr int TILE_M = 128, TILE_N = 128, TILE_K = 64;
+  constexpr int TILE_M = 128, TILE_N = 64, TILE_K = 64;
   constexpr int NUM_THREADS = 256;
   const int M = 1024, N = 1024, K = 1024;
-  // validate_matmul(matmul<TILE_M, TILE_N, TILE_K, NUM_THREADS>, M, N, K, 1e-2);
+  validate_matmul(matmul<TILE_M, TILE_N, TILE_K, NUM_THREADS>, M, N, K, 1e-2);
   benchmark_matmul(matmul<TILE_M, TILE_N, TILE_K, NUM_THREADS>, M, N, K);
 }
