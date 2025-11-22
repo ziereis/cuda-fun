@@ -1,4 +1,4 @@
-# How to match cublas on single precision (M_N_K_f16_f16_f32) matrix multiplication?
+# How to match cublas on half precision (M_N_K_f16_f16_f32) matrix multiplication?
 
 This repo contains educational cuda kernels that build up from a single warp calculating a single 16x8x16 tile using a PTX mma instruction up to outperforming cublas by 20% for a M=N=K=1024 f16xfp16xf32 matrix multiplication.
 
