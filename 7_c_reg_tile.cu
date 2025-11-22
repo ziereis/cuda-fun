@@ -136,6 +136,7 @@ void matmul(half *A, half *B, float *C, int M, int N, int K) {
   matmul_kernel<TILE_M, TILE_N, TILE_K, NUM_THREADS><<<grid_dim, block_dim>>>(A, B, C, M, N, K);
 }
 
+// with tile_N = 128
 // ========== Benchmark Results ==========
 // Matrix dimensions: M=4096, N=4096, K=4096
 // Iterations: 100
@@ -149,15 +150,15 @@ void matmul(half *A, half *B, float *C, int M, int N, int K) {
 // Matrix dimensions: M=1024, N=1024, K=1024
 // Iterations: 100
 //
-// Custom Kernel:  0.1005 ms  (21.36 TFLOPS)
-// cuBLAS:         0.0816 ms  (26.32 TFLOPS)
-// Efficiency:     81.15%
-// Speedup:        0.81x (slower)
+// Custom Kernel:  0.0794 ms  (27.05 TFLOPS)
+// cuBLAS:         0.0816 ms  (26.31 TFLOPS)
+// Efficiency:     102.81%
+// Speedup:        1.03x (faster)
 // =======================================
 int main() {
-  constexpr int TILE_M = 128, TILE_N = 128, TILE_K = 64;
+  constexpr int TILE_M = 128, TILE_N = 64, TILE_K = 64;
   constexpr int NUM_THREADS = 256;
   const int M = 1024, N = 1024, K = 1024;
-  // validate_matmul(matmul<TILE_M, TILE_N, TILE_K, NUM_THREADS>, M, N, K, 1e-2);
+  validate_matmul(matmul<TILE_M, TILE_N, TILE_K, NUM_THREADS>, M, N, K, 1e-2);
   benchmark_matmul(matmul<TILE_M, TILE_N, TILE_K, NUM_THREADS>, M, N, K);
 }

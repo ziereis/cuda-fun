@@ -120,6 +120,8 @@ __global__ void matmul_kernel(half *A, half *B, float *C, int M, int N, int K) {
     asm volatile("cp.async.commit_group;\n" ::);
   }
   for (int k = 0; k < K; k += TILE_K) {
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(NUM_STAGES - 2));
+    __syncthreads();
     int next_k = k + (NUM_STAGES - 1) * TILE_K;
     int write_stage = (next_k / TILE_K) % NUM_STAGES;
 
@@ -127,8 +129,6 @@ __global__ void matmul_kernel(half *A, half *B, float *C, int M, int N, int K) {
       load_stage(next_k, write_stage);
     }
     asm volatile("cp.async.commit_group;\n" ::);
-    asm volatile("cp.async.wait_group %0;\n" :: "n"(NUM_STAGES - 1));
-    __syncthreads();
     int read_stage = (k / TILE_K) % NUM_STAGES;
     mma<TILE_M, TILE_N, TILE_K, LDA, LDB, NUM_THREADS>(
               A_s + (read_stage * TILE_M * LDA), 
@@ -163,14 +163,15 @@ void matmul(half *A, half *B, float *C, int M, int N, int K) {
   matmul_kernel<TILE_M, TILE_N, TILE_K, NUM_THREADS, NUM_STAGES><<<grid_dim, block_dim>>>(A, B, C, M, N, K);
 }
 
+// with NUM_STAGES=2 TILE_N=128
 // ========== Benchmark Results ==========
 // Matrix dimensions: M=4096, N=4096, K=4096
 // Iterations: 100
 //
-// Custom Kernel:  4.7795 ms  (28.76 TFLOPS)
-// cuBLAS:         3.1786 ms  (43.24 TFLOPS)
-// Efficiency:     66.51%
-// Speedup:        0.67x (slower)
+// Custom Kernel:  3.9595 ms  (34.71 TFLOPS)
+// cuBLAS:         3.1815 ms  (43.20 TFLOPS)
+// Efficiency:     80.35%
+// Speedup:        0.80x (slower)
 // =======================================
 // ========== Benchmark Results ==========
 // Matrix dimensions: M=1024, N=1024, K=1024
@@ -182,9 +183,9 @@ void matmul(half *A, half *B, float *C, int M, int N, int K) {
 // Speedup:        0.97x (slower)
 // =======================================
 int main() {
-  constexpr int TILE_M = 128, TILE_N = 64, TILE_K = 64;
+  constexpr int TILE_M = 128, TILE_N = 128, TILE_K = 64;
   constexpr int NUM_THREADS = 256;
-  const int M = 1024, N = 1024, K = 1024;
-  validate_matmul(matmul<TILE_M, TILE_N, TILE_K, NUM_THREADS, 3>, M, N, K, 1e-2);
-  benchmark_matmul(matmul<TILE_M, TILE_N, TILE_K, NUM_THREADS, 3>, M, N, K);
+  const int M = 4*1024, N = 4*1024, K = 4*1024;
+  // validate_matmul(matmul<TILE_M, TILE_N, TILE_K, NUM_THREADS, 3>, M, N, K, 1e-2);
+  benchmark_matmul(matmul<TILE_M, TILE_N, TILE_K, NUM_THREADS, 2>, M, N, K);
 }
