@@ -136,7 +136,21 @@ void matmul(half *A, half *B, float *C, int M, int N, int K) {
   matmul_kernel<TILE_M, TILE_N, TILE_K, NUM_THREADS><<<grid_dim, block_dim>>>(A, B, C, M, N, K);
 }
 
-
+// Results match!
+//
+// ========== Benchmark Results ==========
+// Matrix dimensions: M=1024, N=1024, K=1024
+// Iterations: 100
+//
+// Custom Kernel:  0.6665 ms  (3.22 TFLOPS)
+// cuBLAS:         0.0816 ms  (26.32 TFLOPS)
+// Efficiency:     12.24%
+// Speedup:        0.12x (slower)
+// =======================================
 int main() {
-  validate_matmul(matmul<32, 32, 32, 64>, 64, 64, 64);
+  constexpr int TILE_M = 128, TILE_N = 128, TILE_K = 64;
+  constexpr int NUM_THREADS = 256;
+  const int M = 1024, N = 1024, K = 1024;
+  validate_matmul(matmul<TILE_M, TILE_N, TILE_K, NUM_THREADS>, M, N, K);
+  benchmark_matmul(matmul<TILE_M, TILE_N, TILE_K, NUM_THREADS>, M, N, K);
 }
